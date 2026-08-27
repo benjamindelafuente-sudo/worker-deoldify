@@ -30,7 +30,7 @@ RUN pip install --no-cache-dir \
 # Bake the ONNX model (~122 MB) — downloaded at build time from public mirror
 RUN mkdir -p /app/models && \
     wget -q \
-        "https://github.com/instant-high/deoldify-onnx/releases/download/v1.0.0/deoldify_fp16.onnx" \
+        "https://github.com/instant-high/deoldify-onnx/releases/download/deoldify-onnx/deoldify_fp16.onnx" \
         -O /app/models/deoldify_fp16.onnx && \
     ls -lh /app/models/
 
