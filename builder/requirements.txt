@@ -1,13 +1,9 @@
-fastai==1.0.60
-tensorboardX>=1.6
-ffmpeg-python
-yt-dlp
-opencv-python>=4.2.0.32
-Pillow
-tornado
-imgaug==0.2.6
-runpod
-IPython
---extra-index-url https://download.pytorch.org/whl/cu113
-torch==1.11.0
-torchvision==0.12.0
+# Python deps for the worker image. Most are installed by the Dockerfile
+# (torch, fastai, ffmpeg). This file lists the additional ones required
+# by handler.py at runtime.
+#
+# Note — we do NOT pin torch/torchvision here; those are baked by the base
+# runpod/pytorch image and pinned via the FROM tag.
+
+requests>=2.31        # for input download (urllib works too, but requests is cleaner)
+Pillow>=10.0          # for the DeOldify colorizer output (saved PIL.Image)

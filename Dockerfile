@@ -1,24 +1,53 @@
-# Base image -> https://github.com/runpod/containers/blob/main/official-templates/base/Dockerfile
-# DockerHub -> https://hub.docker.com/r/runpod/base/tags
-FROM runpod/base:0.6.2-cuda12.1.0
+FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 
-# The base image comes with many system dependencies pre-installed to help you get started quickly.
-# Please refer to the base image's Dockerfile for more information before adding additional dependencies.
-# IMPORTANT: The base image overrides the default huggingface cache location.
+ENV DEBIAN_FRONTEND=noninteractive
+
+# System deps
+RUN apt-get update -y && \
+    apt-get install -y ffmpeg libgl1 libglib2.0-0 wget git && \
+    rm -rf /var/lib/apt/lists/*
+
+# Python deps — DeOldify + a wget helper. Pinned for reproducibility.
+RUN pip install --no-cache-dir \
+    "torch==2.4.0" \
+    "torchvision==0.19.0" \
+    "fastai==2.7.18" \
+    "fastcore==1.5.29" \
+    "wandb<0.16" \
+    "fsspec<2024.10" \
+    "numpy<2" \
+    "opencv-python-headless" \
+    "Pillow" \
+    "requests"
+
+# Clone DeOldify (jantic/DeOldify, MIT). Pin a commit estable.
+ARG DEOLDIFY_COMMIT=523fd34
+RUN git clone https://github.com/jantic/DeOldify.git /DeOldify && \
+    cd /DeOldify && \
+    git checkout ${DEOLDIFY_COMMIT}
+
+# Patch: el repo original usa wandb>=0.16 que rompe el import. Downgradeamos via pip arriba.
+# Patch: silence warnings, install any missing subdeps
+RUN pip install --no-cache-dir -r /DeOldify/requirements.txt || true
+
+# Bake the Video colorizer weights (~285 MB) — optimized for flicker-free video.
+# data.deepai.org is the official mirror (same model as in the original repo).
+RUN mkdir -p /DeOldify/models && \
+    cd /DeOldify/models && \
+    wget -q https://data.deepai.org/deoldify/ColorizeVideo_gen.pth && \
+    wget -q https://data.deepai.org/deoldify/ColorizeVideo_crit.pth
+
+# Pre-download any other resources DeOldify needs on first run
+ENV DEOLDIFY_DEVICE=cuda
 
 WORKDIR /app
 
-# Python dependencies
-COPY builder/requirements.txt /requirements.txt
-RUN python3.11 -m pip install --upgrade pip && \
-    python3.11 -m pip install --upgrade -r /requirements.txt --no-cache-dir && \
-    rm /requirements.txt
+# Copy our serverless handler
+COPY handler.py /app/handler.py
+COPY rp_schemas.py /app/rp_schemas.py
 
-RUN git clone https://github.com/jantic/DeOldify.git /app
+# DeOldify modules are at /DeOldify — add to path
+ENV PYTHONPATH=/DeOldify:/app
 
-# Add src files (Worker Template)
-ADD src /app
-
-RUN wget -O models/ColorizeArtistic_gen.pth https://data.deepai.org/deoldify/ColorizeArtistic_gen.pth
-
-CMD python3.11 -u /app/handler.py
+# RunPod serverless entrypoint
+CMD ["python3", "-u", "/app/handler.py"]
