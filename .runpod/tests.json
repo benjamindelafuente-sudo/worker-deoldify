@@ -4,7 +4,6 @@
         "name": "video_colorization_basic",
         "input": {
           "video_url": "https://litter.catbox.moe/6a7fw3.mp4",
-          "model": "Video",
           "render_factor": 21,
           "watermark": false
         },

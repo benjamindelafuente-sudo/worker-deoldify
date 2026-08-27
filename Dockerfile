@@ -1,33 +1,43 @@
-# worker-deoldify-VIDEO — RunPod Serverless worker para colorizar video.
-# Estrategia: usar la imagen oficial del repo kodxana/worker-deoldify
-# (que ya viene con DeOldify Artistic bakeado para imagenes) y agregar
-# soporte para video en runtime via loop de frames.
+# ONNX-based DeOldify Video colorizer for RunPod Serverless.
+# No fastai, no wandb. Just torch + onnxruntime.
 #
-# Esto evita reconstruir DeOldify+wandb+fastai desde cero (que tiene
-# conflictos de dependencias en torch 2.x).
+# Model: we wget the ONNX file from the instant-high public GitHub
+# release at build time. Saves 122MB from the repo and avoids GitHub's
+# 100MB file size limit.
 
-FROM ghcr.io/kodxana/worker-deoldify:latest
+FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 
-# Nos aseguramos de que el modelo Video (no Artistic) este presente.
-# La imagen base viene con Artistic, asi que descargamos el Video al lado.
-USER root
+ENV DEBIAN_FRONTEND=noninteractive
 
-# Verificar ffmpeg presente
-RUN which ffmpeg || apt-get update -y && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+# System deps — ffmpeg required for extract/recompose
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        ffmpeg \
+        libgl1 \
+        libglib2.0-0 \
+        wget \
+    && rm -rf /var/lib/apt/lists/*
 
-# Bajar el modelo Video (~285 MB) — distinto del Artistic que ya viene.
-# El modelo Video es mas estable para video (menos flickr).
-RUN mkdir -p /DeOldify/models && \
-    cd /DeOldify/models && \
-    wget -q https://data.deepai.org/deoldify/ColorizeVideo_gen.pth -O ColorizeVideo_gen.pth && \
-    wget -q https://data.deepai.org/deoldify/ColorizeVideo_crit.pth -O ColorizeVideo_crit.pth && \
-    ls -la
+# Python deps (torch already in base image)
+RUN pip install --no-cache-dir \
+        "onnxruntime-gpu==1.18.0" \
+        "opencv-python-headless>=4.8" \
+        "Pillow>=10.0" \
+        "numpy<2" \
+        "requests>=2.31" \
+        "runpod>=1.6"
 
-# Reescribir el handler.py con nuestra version de video
+# Bake the ONNX model (~122 MB) — downloaded at build time from public mirror
+RUN mkdir -p /app/models && \
+    wget -q \
+        "https://github.com/instant-high/deoldify-onnx/releases/download/v1.0.0/deoldify_fp16.onnx" \
+        -O /app/models/deoldify_fp16.onnx && \
+    ls -lh /app/models/
+
+# Bake the handler
+WORKDIR /app
 COPY src/handler.py /app/handler.py
 COPY src/rp_schemas.py /app/rp_schemas.py
 
-WORKDIR /app
-
-# runpod serverless entrypoint
+# Entrypoint
 CMD ["python3", "-u", "/app/handler.py"]

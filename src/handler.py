@@ -1,13 +1,17 @@
-"""worker-deoldify-video — RunPod Serverless handler.
+"""DeOldify ONNX Video colorizer — RunPod Serverless worker.
 
-Colorizes B&W video clips with the DeOldify Video model (Artistic=false),
-which is optimized for flicker-free temporal consistency (better than the
-Artistic model for video).
+Uses the ONNX export of DeOldify (jantic/DeOldify → ONNX via
+instant-high/deoldify-onnx). NO fastai, NO wandb, just torch +
+onnxruntime. Fits cleanly in a slim Docker image.
+
+Bake strategy:
+- Base: runpod/pytorch:2.4.0 (torch 2.4 + CUDA 12.4)
+- Install: opencv-python-headless, onnxruntime-gpu, Pillow, requests
+- Bake the ONNX model (~122 MB) into the image
 
 INPUT (job["input"]):
     {
         "video_url": "https://...   |   s3://bucket/key",
-        "model":     "Video",        # opcional, default "Video"
         "render_factor": 21,         # opcional, default 21
         "watermark": False,          # opcional, default False
     }
@@ -17,16 +21,8 @@ OUTPUT:
         "output_url": "https://litter.catbox.moe/...mp4",
         "duration_sec": 5.0,
         "frames_processed": 120,
-        "model": "Video",
         "elapsed_sec": 32.4
     }
-
-PIPELINE:
-    1. download video from URL to /tmp
-    2. extract frames with ffmpeg
-    3. colorize each frame with DeOldify Video
-    4. re-encode frames back to mp4 with original audio
-    5. upload to litterbox.catbox.moe (24h expiry), return URL
 """
 
 import os
@@ -36,49 +32,77 @@ import tempfile
 import time
 from pathlib import Path
 
-# DeOldify lives at /DeOldify (baked in by Dockerfile).
-sys.path.insert(0, "/DeOldify")
-sys.path.insert(0, "/app")
+import requests
+from PIL import Image
+import numpy as np
+import cv2
+import onnxruntime as ort
 
-from deoldify import device as deoldify_device  # noqa: E402
-from deoldify.device_id import DeviceId  # noqa: E402
-deoldify_device.set(device=DeviceId.GPU0)
-
-from deoldify.visualize import get_image_colorizer  # noqa: E402
-
-import runpod  # noqa: E402
-from rp_schemas import INPUT_SCHEMA, OUTPUT_SCHEMA  # noqa: E402
+import runpod
+from rp_schemas import INPUT_SCHEMA, OUTPUT_SCHEMA
 
 
 # ---------------------------------------------------------------------------
-# Init: load colorizer ONCE per worker
+# Init: load ONNX session ONCE per worker (1-2 sec)
 # ---------------------------------------------------------------------------
-print("[init] Cargando DeOldify Video colorizer (1 sola vez por worker)...", flush=True)
+print("[init] Loading DeOldify ONNX Video colorizer...", flush=True)
 _init_t = time.time()
-colorizer = get_image_colorizer(artistic=False)  # artistic=False = Video model
-print(f"[init] Colorizer listo en {time.time()-_init_t:.1f}s", flush=True)
+
+MODEL_PATH = Path("/app/models/deoldify_fp16.onnx")
+assert MODEL_PATH.exists(), f"Model not found: {MODEL_PATH}"
+
+so = ort.SessionOptions()
+so.intra_op_num_threads = 2  # each worker uses 2 threads; 4 parallel workers = 8 threads
+so.inter_op_num_threads = 1
+so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+session = ort.InferenceSession(
+    str(MODEL_PATH),
+    sess_options=so,
+    providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+)
+INP_NAME = session.get_inputs()[0].name
+print(f"[init] ONNX session loaded in {time.time()-_init_t:.1f}s", flush=True)
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# ONNX colorizer (mirrors the sandbox implementation that worked)
 # ---------------------------------------------------------------------------
 
-def _run(cmd, *, timeout=300, capture=True):
-    """Run subprocess, raise on non-zero."""
-    r = subprocess.run(cmd, capture_output=capture, text=True, timeout=timeout)
+def colorize_frame(bgr: np.ndarray, render_size: int = 256) -> np.ndarray:
+    """Colorize a single BGR frame (uint8, HxWx3)."""
+    h, w = bgr.shape[:2]
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    target_LAB = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    target_L = target_LAB[:, :, 0]
+
+    rgb_3ch = cv2.cvtColor(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2RGB)
+    rgb_resized = cv2.resize(rgb_3ch, (render_size, render_size))
+    x = rgb_resized.astype(np.float16).transpose(2, 0, 1)[None, ...]
+
+    y = session.run(None, {INP_NAME: x})[0][0]
+    out_hwc = y.transpose(1, 2, 0).astype(np.float32)
+    out_rgb = cv2.cvtColor(out_hwc, cv2.COLOR_BGR2RGB).astype(np.uint8)
+    out_rgb = cv2.resize(out_rgb, (w, h), interpolation=cv2.INTER_CUBIC)
+    out_rgb = cv2.GaussianBlur(out_rgb, (13, 13), 0)
+    out_LAB = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2LAB)
+    _, A, B = cv2.split(out_LAB)
+    merged = cv2.merge((target_L, A, B))
+    return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+
+
+# ---------------------------------------------------------------------------
+# I/O helpers
+# ---------------------------------------------------------------------------
+
+def _run(cmd, *, timeout=300):
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
-        err = (r.stderr or r.stdout or "<no output>")[-2000:]
-        raise RuntimeError(f"cmd failed ({r.returncode}): {' '.join(map(str, cmd[:6]))}... — {err}")
+        raise RuntimeError(f"cmd failed ({r.returncode}): {' '.join(map(str, cmd[:6]))} — {(r.stderr or r.stdout or '')[-1500:]}")
     return r
 
 
 def _upload_to_litterbox(local_path: Path, expiry: str = "24h") -> str:
-    """Upload to litterbox.catbox.moe via multipart form-data.
-    Returns the public URL.
-    """
-    import urllib.request
     import uuid
-
     boundary = f"----x{uuid.uuid4().hex}"
     body = []
     for k, v in (("reqtype", "fileupload"), ("time", expiry)):
@@ -90,30 +114,25 @@ def _upload_to_litterbox(local_path: Path, expiry: str = "24h") -> str:
     with open(local_path, "rb") as f:
         body.append(f.read())
     body.append(f"\r\n--{boundary}--\r\n".encode())
-
-    req = urllib.request.Request(
+    req = requests.post(
         "https://litterbox.catbox.moe/resources/internals/api.php",
         data=b"".join(body),
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        timeout=180,
     )
-    with urllib.request.urlopen(req, timeout=180) as resp:
-        url = resp.read().decode().strip()
+    url = req.text.strip()
     if not url.startswith("http"):
         raise RuntimeError(f"litterbox returned non-URL: {url!r}")
     return url
 
 
-def _download(url: str, dst: Path) -> Path:
-    """Download a video from http(s) URL to dst. Streams to disk."""
-    import urllib.request
-    req = urllib.request.Request(url, headers={"User-Agent": "worker-deoldify-video/1.0"})
-    with urllib.request.urlopen(req, timeout=120) as resp, open(dst, "wb") as f:
-        while True:
-            chunk = resp.read(64 * 1024)
-            if not chunk:
-                break
-            f.write(chunk)
-    return dst
+def _download(url: str, dst: Path) -> None:
+    with requests.get(url, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        with open(dst, "wb") as f:
+            for chunk in r.iter_content(chunk_size=64 * 1024):
+                if chunk:
+                    f.write(chunk)
 
 
 def _probe_fps(path: Path) -> float:
@@ -136,20 +155,10 @@ def _probe_duration(path: Path) -> float:
     return float(r.stdout.strip())
 
 
-def _colorize_one(pil_path: Path, out_path: Path, render_factor: int, watermark: bool):
-    """Colorize a single frame with DeOldify Video model."""
-    pil_image = colorizer.get_transformed_image(
-        str(pil_path),
-        render_factor=render_factor,
-        watermarked=watermark,
-    )
-    pil_image.save(str(out_path))
-
-
 def colorize_video(in_path: Path, out_path: Path, *,
                    render_factor: int, watermark: bool,
                    job=None) -> tuple[int, float]:
-    """Extract frames, colorize each, recompose. Returns (n_frames, elapsed_sec)."""
+    """Extract frames with ffmpeg, colorize each via ONNX, recompose."""
     t0 = time.time()
     fps = _probe_fps(in_path)
 
@@ -159,7 +168,6 @@ def colorize_video(in_path: Path, out_path: Path, *,
     frames_in.mkdir()
     frames_out.mkdir()
 
-    # 1) Extract frames
     _run([
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", str(in_path),
@@ -175,13 +183,15 @@ def colorize_video(in_path: Path, out_path: Path, *,
     if job is not None:
         runpod.serverless.progress_update(job, f"extracted {n} frames @ {fps:.2f}fps")
 
-    # 2) Colorize each
     for i, fp in enumerate(frames, 1):
-        _colorize_one(fp, frames_out / fp.name, render_factor, watermark)
+        bgr = cv2.imread(str(fp))
+        if bgr is None:
+            continue
+        col = colorize_frame(bgr, render_size=render_factor)
+        cv2.imwrite(str(frames_out / fp.name), col, [cv2.IMWRITE_PNG_COMPRESSION, 3])
         if job is not None and i % 10 == 0:
             runpod.serverless.progress_update(job, f"colorized {i}/{n}")
 
-    # 3) Recompose with original audio
     _run([
         "ffmpeg", "-y", "-loglevel", "error",
         "-framerate", str(fps),
@@ -195,6 +205,9 @@ def colorize_video(in_path: Path, out_path: Path, *,
         "-shortest",
         str(out_path),
     ], timeout=300)
+
+    # watermark param accepted but not implemented (would burn text via ffmpeg drawtext)
+    del watermark
 
     return n, time.time() - t0
 
@@ -211,7 +224,6 @@ def handler(job):
     if not video_url:
         return {"error": "missing 'video_url' in input"}
 
-    model = job_input.get("model", "Video")
     render_factor = int(job_input.get("render_factor", 21))
     watermark = bool(job_input.get("watermark", False))
 
@@ -224,7 +236,7 @@ def handler(job):
         _download(video_url, in_path)
         print(f"[job {job_id}] downloaded {in_path.stat().st_size//1024} KB", flush=True)
 
-        print(f"[job {job_id}] colorizing with model={model} render={render_factor}...", flush=True)
+        print(f"[job {job_id}] colorizing render={render_factor}...", flush=True)
         n_frames, elapsed = colorize_video(
             in_path, out_path,
             render_factor=render_factor,
@@ -232,7 +244,7 @@ def handler(job):
             job=job,
         )
         dur = _probe_duration(out_path)
-        print(f"[job {job_id}] done: {n_frames} frames, {elapsed:.1f}s, {dur:.1f}s video", flush=True)
+        print(f"[job {job_id}] done: {n_frames} frames, {elapsed:.1f}s wall, {dur:.1f}s video", flush=True)
 
         print(f"[job {job_id}] uploading to litterbox...", flush=True)
         output_url = _upload_to_litterbox(out_path, expiry="24h")
@@ -241,7 +253,6 @@ def handler(job):
             "output_url": output_url,
             "duration_sec": round(dur, 2),
             "frames_processed": n_frames,
-            "model": model,
             "elapsed_sec": round(elapsed, 1),
             "size_bytes": out_path.stat().st_size,
         }
@@ -249,14 +260,9 @@ def handler(job):
         print(f"[job {job_id}] ERROR: {e}", flush=True)
         return {"error": str(e), "job_id": job_id}
     finally:
-        # Cleanup workdir
         import shutil
         shutil.rmtree(work, ignore_errors=True)
 
-
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
 
 print("[handler] starting RunPod serverless", flush=True)
 runpod.serverless.start({"handler": handler})
