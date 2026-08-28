@@ -2,11 +2,7 @@
     "tests": [
       {
         "name": "video_colorization_basic",
-        "input": {
-          "video_url": "https://litter.catbox.moe/6a7fw3.mp4",
-          "render_factor": 21,
-          "watermark": false
-        },
+        "input": {"video_url": "https://litter.catbox.moe/059drx.mp4", "render_factor": 21},
         "timeout": 180000
       }
     ]
