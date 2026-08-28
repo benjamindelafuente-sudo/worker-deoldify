@@ -11,8 +11,20 @@ RUN apt-get update -y && \
         ffmpeg \
         libgl1 \
         libglib2.0-0 \
-        wget \
+        curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Bake the ONNX model (~122 MB) at build time.
+# Use curl -fL (no wget): -L follows redirects (GitHub releases use signed URLs),
+# -f fails clean on HTTP error so build fails fast if URL is bad.
+RUN mkdir -p /app/models && \
+    curl -fL --retry 3 --retry-delay 2 \
+        "https://github.com/instant-high/deoldify-onnx/releases/download/deoldify-onnx/deoldify_fp16.onnx" \
+        -o /app/models/deoldify_fp16.onnx && \
+    ls -lh /app/models/
+
+# Verify model file is valid ONNX (not truncated / 404 HTML page)
+RUN python3 -c "import onnx; m = onnx.load('/app/models/deoldify_fp16.onnx'); print(f'OK: {len(m.graph.node)} nodes')"
 
 # Python deps (torch already in base image)
 RUN pip install --no-cache-dir \
@@ -23,15 +35,11 @@ RUN pip install --no-cache-dir \
         "requests>=2.31" \
         "runpod>=1.6"
 
-# Bake the ONNX model (~122 MB) at build time
-# Using HuggingFace mirror that doesn't require auth
-RUN mkdir -p /app/models && \
-    wget -q \
-        "https://github.com/instant-high/deoldify-onnx/releases/download/deoldify-onnx/deoldify_fp16.onnx" \
-        -O /app/models/deoldify_fp16.onnx
-
 WORKDIR /app
 COPY src/handler.py /app/handler.py
 COPY src/rp_schemas.py /app/rp_schemas.py
+
+# Verify handler imports cleanly (catches missing deps early)
+RUN python3 -c "import sys; sys.path.insert(0, '/app'); import handler; print('handler imports OK')"
 
 CMD ["python3", "-u", "/app/handler.py"]
